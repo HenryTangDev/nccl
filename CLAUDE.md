@@ -238,6 +238,48 @@ NCCL supports three types of plugins:
 - **src/allocator.cc** - Custom memory allocator
 - **src/register/** - Memory registration for RDMA operations
 
+### Additional Core Components
+
+**Proxy System** (`src/proxy.cc`):
+- Background CPU threads that drive network operations asynchronously
+- Key structures: `ncclProxyState`, `ncclProxyOp`, `ncclProxyProgressState`
+- Separates GPU compute from network communication overhead so GPU kernels don't block on network
+
+**Bootstrap System** (`src/bootstrap.cc`):
+- Initial communicator setup: GPU discovery and rank assignment
+- Environment-based multi-node initialization before NCCL communicators are ready
+
+**Group Operations** (`src/group.cc`):
+- Implements `ncclGroupStart()` / `ncclGroupEnd()` for batching multiple collectives
+- Defers kernel launches until `ncclGroupEnd()` for fused execution and reduced overhead
+
+**Symmetric Memory** (`src/device/symmetric/`):
+- GPU-resident collective implementations using symmetric (all-ranks-same-address) memory
+- Has its own `generate.py` for kernel code generation
+- Covers all-reduce, all-gather, reduce-scatter variants
+
+**One-sided and GPU-Initiated Networking** (`src/rma/`, `src/gin/`):
+- `src/rma/` - One-sided RMA (Remote Memory Access) operations
+- `src/gin/` - GPU Initiated Networking: GPU kernels directly trigger network operations
+
+### Examples (`examples/`)
+
+In-repo example programs for testing and learning:
+- `01_communicators` - Communicator creation and teardown
+- `02_point_to_point` - Send/recv operations
+- `03_collectives` - All collective operation types
+- `04_user_buffer_registration` - Custom buffer registration
+- `05_symmetric_memory` - Symmetric memory API usage
+- `06_device_api` - Device-side API
+
+### CMake Build System
+
+Parallel CMake build alongside Make (30+ `CMakeLists.txt` files). Use for IDE integration or when the Make system is insufficient.
+
+### Python Bindings (`nccl4py/`)
+
+Pure Python wrapper with Torch/CuPy interop support. Uses `uv` for dependency management.
+
 ## Topology Detection and Algorithm Selection
 
 ### Topology Graph Construction (`src/graph/topo.cc`)
@@ -286,6 +328,15 @@ make NVTX=0                           # Disable NVTX profiling markers
 make ASAN=1                           # Address sanitizer build
 make GCOV=1 DEBUG=1                   # Code coverage build
 ```
+
+### NCCL_PARAM Pattern
+
+Environment variables are declared via the `NCCL_PARAM` macro:
+```c
+NCCL_PARAM(Name, "ENV_VAR_NAME", default_value)
+// Generates: ncclParamName() — thread-safe, lazy-initialized getter
+```
+Used throughout the codebase for all runtime configuration. Search `NCCL_PARAM` to find every tunable parameter.
 
 ### Testing
 Tests are maintained in a separate repository:
@@ -351,6 +402,11 @@ Version information is embedded in build artifacts through template processing o
 - **Architecture Support**: Kernels automatically filtered based on CUDA architecture capabilities
 - **Template Specialization**: `best_kernel()` function controls which kernel variants are specialized
 - **Algorithm Coverage**: Each collective supports specific algorithms (e.g., AllReduce: TREE, RING, COLLNET_DIRECT, COLLNET_CHAIN, NVLS, NVLS_TREE)
+- **CRITICAL — Enum Ordering**: Enum order in `src/include/device.h` MUST match `src/device/generate.py`. Mismatch causes silent wrong-kernel dispatch. Affected enums:
+  - Collectives: Broadcast, Reduce, AllGather, ReduceScatter, AllReduce, SendRecv
+  - Reduction ops: Sum, Prod, MinMax, PreMulSum, SumPostDiv
+  - Protocols: LL, LL128, SIMPLE
+  - Algorithms: TREE, RING, COLLNET_DIRECT, COLLNET_CHAIN, NVLS, NVLS_TREE, PAT
 
 ### Data Movement Primitives (`src/device/primitives.h`)
 - **`directSend()`**: Direct peer-to-peer data transfer between GPUs
@@ -378,6 +434,8 @@ Version information is embedded in build artifacts through template processing o
 - **CollNet Requirements**: Network hardware with collective offload (e.g., InfiniBand SHARP)
 - **Memory Alignment**: NVLS uses 2MB alignment (`NVLS_MEM_ALIGN_SIZE`) for optimal performance
 - **Channel Scaling**: NVLS channels scale with architecture (16→32 channels from Hopper→Blackwell)
+- **RMA** (`src/rma/`): One-sided Remote Memory Access operations for put/get patterns
+- **GIN** (`src/gin/`): GPU Initiated Networking — GPU kernels directly trigger network transfers without CPU involvement
 
 ### Debugging and Instrumentation
 - **NVTX Integration**: Built-in profiling markers for GPU timeline analysis (disable with `NVTX=0`)
