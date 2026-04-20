@@ -14,7 +14,6 @@
 // ============================================================================
 // Configuration constants
 // ============================================================================
-#define NUM_MAX_NVL_PEERS 8
 #define NUM_MAX_RDMA_PEERS 20
 #define NUM_WORKSPACE_BYTES (32 * 1024 * 1024)
 #define NUM_MAX_LOCAL_EXPERTS 1024
@@ -24,7 +23,7 @@
 #define FINISHED_SUM_TAG 1024
 #define NUM_WAIT_NANOSECONDS 500
 #define MAX_SUPPORTED_TOKENS_PER_RANK 8192  // Must match kernel template in hybridep_adapter.cu
-#define HT_OF_NUM_TOKENS_PER_CHUNK 128
+#define HT_OF_NUM_TOKENS_PER_CHUNK 64
 
 #ifndef ENABLE_FAST_DEBUG
 #define NUM_CPU_TIMEOUT_SECS 100
@@ -38,7 +37,6 @@
 #define LOW_LATENCY_RECV_PHASE 2
 
 // NCCL GIN Configuration
-#define NUM_GPUS_PER_NODE_LOW_LATENCY 8
 
 // Make CLion CUDA indexing work
 #ifdef __CLION_IDE__

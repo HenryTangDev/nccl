@@ -355,6 +355,7 @@ __hidden ncclResult_t pluginGetCollInfo(void* context, ncclFunc_t collType, size
                               int regBuff, int* nChannels) {
   TunerContext* ctx = (TunerContext*)context;
   if (!ctx) return ncclInternalError;
+  float (*table)[NCCL_NUM_PROTOCOLS] = (float (*)[NCCL_NUM_PROTOCOLS])collCostTable;
 
   // Default channels
   *nChannels = 1;
@@ -393,14 +394,14 @@ __hidden ncclResult_t pluginGetCollInfo(void* context, ncclFunc_t collType, size
 
       // Check bounds
       if (config->algorithm < numAlgo && config->protocol < numProto) {
-        if (collCostTable[config->algorithm][config->protocol] != NCCL_ALGO_PROTO_IGNORE) {
+        if (table[config->algorithm][config->protocol] != NCCL_ALGO_PROTO_IGNORE) {
           if (ctx->logFunction) {
             ctx->logFunction(NCCL_LOG_TRACE, NCCL_TUNING, __FILE__, __LINE__,
                              "TUNER/ExamplePlugin: Setting cost table[%s][%s] (%p) = 0.0 (was %.1f)",
                              algorithmToString(config->algorithm), protocolToString(config->protocol),
-                             &collCostTable[config->algorithm][config->protocol], collCostTable[config->algorithm][config->protocol]);
+                             &table[config->algorithm][config->protocol], table[config->algorithm][config->protocol]);
           }
-          collCostTable[config->algorithm][config->protocol] = 0.0; // Set low cost to prefer this configuration
+          table[config->algorithm][config->protocol] = 0.0; // Set low cost to prefer this configuration
 
           // Only override channels if not set to -1 (keep default)
           if (config->nChannels != -1) {
@@ -458,6 +459,33 @@ __hidden ncclResult_t pluginGetCollInfo(void* context, ncclFunc_t collType, size
   return ncclSuccess;
 }
 
+__hidden ncclResult_t pluginGetChunkSize(void* context, ncclFunc_t collType, size_t nBytes,
+                                         int algo, int proto, int nChannels, size_t* chunkSize) {
+  TunerContext* ctx = (TunerContext*)context;
+  if (!ctx) return ncclInternalError;
+
+  size_t originalChunkSize = *chunkSize;
+  size_t minChunkSize = 0;
+
+  if (algo == NCCL_ALGO_NVLS_TREE && proto == NCCL_PROTO_SIMPLE) {
+    minChunkSize = 32768;
+  }
+
+  if (minChunkSize > 0 && *chunkSize < minChunkSize) {
+    *chunkSize = minChunkSize;
+  }
+
+  if (ctx->logFunction && *chunkSize != originalChunkSize) {
+    ctx->logFunction(NCCL_LOG_INFO, NCCL_TUNING, __FILE__, __LINE__,
+                     "TUNER/ExamplePlugin: getChunkSize - collType=%s, nBytes=%zu, algo=%s, proto=%s, nChannels=%d: "
+                     "chunk size %zu -> %zu",
+                     collTypeToString(collType), nBytes, algorithmToString(algo), protocolToString(proto),
+                     nChannels, originalChunkSize, *chunkSize);
+  }
+
+  return ncclSuccess;
+}
+
 __hidden ncclResult_t pluginFinalize(void* context) {
   if (context) {
     TunerContext* ctx = (TunerContext*)context;
@@ -472,6 +500,16 @@ __hidden ncclResult_t pluginFinalize(void* context) {
 
 #define PLUGIN_NAME "Example"
 
+// Export V6 plugin with getChunkSize support
+const ncclTuner_v6_t ncclTunerPlugin_v6 = {
+  .name = PLUGIN_NAME,
+  .init = pluginInit,
+  .getCollInfo = pluginGetCollInfo,
+  .getChunkSize = pluginGetChunkSize,
+  .finalize = pluginFinalize
+};
+
+// Also export V5 plugin for backward compatibility
 const ncclTuner_v5_t ncclTunerPlugin_v5 = {
   .name = PLUGIN_NAME,
   .init = pluginInit,

@@ -35,6 +35,7 @@ ncclResult_t ncclCeInit(struct ncclComm* comm) {
   NCCLCHECKGOTO(ncclMemAlloc((void**)&ceDevBase, ceDevBaseSize), ret, fail);
   NCCLCHECKGOTO(ncclDevrWindowRegisterInGroup(comm, ceDevBase, ceDevBaseSize, NCCL_WIN_COLL_SYMMETRIC, &ceWinDev), ret, fail);
   NCCLCHECKGOTO(ncclShadowPoolToHost(&comm->devrState.shadows, ceWinDev, &ceWinDevHost), ret, fail);
+  NCCLCHECKGOTO(ncclCudaCalloc(&comm->ceColl.ceSeqNumDev, 2, comm->memManager), ret, fail);
   // Get the ncclDevrWindow from the winHost field
   comm->ceColl.ceSyncWin = (struct ncclDevrWindow*)ceWinDevHost->winHost;
 
@@ -46,11 +47,13 @@ ncclResult_t ncclCeInit(struct ncclComm* comm) {
   comm->ceColl.useCompletePtr = false;
   comm->ceColl.intraBatchSyncFreq = CE_COLL_INTRA_BATCH_SYNC_FREQ;
   comm->ceColl.intraBatchSyncMsgThreshold = CE_COLL_INTRA_BATCH_SYNC_MSG_THRESHOLD;
+  NCCLCHECKGOTO(ncclCudaMemcpy(comm->ceColl.ceSeqNumDev+1, (uint32_t*)&GRAPH_SYNC_VALUE, 1), ret, fail);
   INFO(NCCL_INIT, "Init CE, rank %d baseUCSymReadyPtr %p, baseUCSymComplPtr %p, seq num %d", comm->rank, comm->ceColl.baseUCSymReadyPtr, comm->ceColl.baseUCSymComplPtr, comm->ceColl.ceSeqNum);
 
 exit:
   return ret;
 fail:
+  ncclCudaFree(comm->ceColl.ceSeqNumDev, comm->memManager);
   // Clean up partial initialization - both functions handle null safely
   ncclCommWindowDeregister(comm, ceWinDev);
   ncclMemFree(ceDevBase);
@@ -70,7 +73,9 @@ ncclResult_t ncclCeFinalize(struct ncclComm* comm) {
   // Note: both functions handle null safely
   NCCLCHECKIGNORE(ncclCommWindowDeregister(comm, comm->ceColl.ceSyncWin ? comm->ceColl.ceSyncWin->vidmem : nullptr), ret);
   NCCLCHECKIGNORE(ncclMemFree(comm->ceColl.baseUCSymReadyPtr), ret);
+  NCCLCHECKIGNORE(ncclCudaFree(comm->ceColl.ceSeqNumDev, comm->memManager), ret);
 
+  comm->ceColl.ceSeqNumDev = nullptr;
   comm->ceColl.baseUCSymReadyPtr = nullptr;
   comm->ceColl.baseUCSymComplPtr = nullptr;
   comm->ceColl.ceSyncWin = nullptr;
@@ -102,8 +107,8 @@ bool ncclCeAvailable(struct ncclComm* comm, ncclFunc_t coll, int/*ncclDevRedOp_t
     TRACE(NCCL_TUNING, "Skipping CE collective: not implemented");
     return false;
   }
-  if (comm->nNodes > 1) {
-    TRACE(NCCL_TUNING, "Skipping CE collective: comm is not a single node");
+  if (ncclTeamLsa(comm).nRanks < comm->nRanks) {
+    TRACE(NCCL_TUNING, "Skipping CE collective: not all ranks have NVLink connectivity");
     return false;
   }
   if (!comm->symmetricSupport) {
@@ -126,8 +131,6 @@ ncclResult_t ncclPrepMCSync(struct ncclComm* comm, bool isComplete, CUstreamBatc
   bool capturing = ncclCudaGraphValid(comm->planner.capturingGraph);
   uint32_t currentSeq = ++comm->ceColl.ceSeqNum;
 
-  // Source pointer is either the constant graph sync value or the sequence number
-  void* srcPtr = capturing ? (void*)&GRAPH_SYNC_VALUE : (void*)&currentSeq;
   // Wait value is either the constant graph sync value or the sequence number
   uint32_t waitValue = capturing ? GRAPH_SYNC_VALUE : currentSeq;
 
@@ -137,12 +140,18 @@ ncclResult_t ncclPrepMCSync(struct ncclComm* comm, bool isComplete, CUstreamBatc
   size_t offset = (uint8_t*)dstPtr - (uint8_t*)comm->ceColl.ceSyncWin->userPtr;
   NCCLCHECKGOTO(ncclDevrGetLsaTeamPtrMC(comm, comm->ceColl.ceSyncWin, offset, ncclTeamLsa(comm), &mcDstPtr), ret, fail);
 
+  // Store the updated sequence number in the device buffer.
+  if (!capturing) {
+    CUCHECKGOTO(cuStreamWriteValue32(stream, (CUdeviceptr)comm->ceColl.ceSeqNumDev, currentSeq,
+                                     CU_STREAM_WRITE_VALUE_DEFAULT), ret, fail);
+  }
+
   // Write our own ready/complete flag to the multi-cast address
   CUDACHECKGOTO(cudaMemcpyAsync(
     mcDstPtr,
-    srcPtr,
+    comm->ceColl.ceSeqNumDev+capturing,
     sizeof(uint32_t),
-    cudaMemcpyHostToDevice,
+    cudaMemcpyDeviceToDevice,
     stream), ret, fail);
 
   // Add local wait operations for every other rank
@@ -173,6 +182,11 @@ ncclResult_t ncclPrepUCSync(struct ncclComm* comm, bool isComplete,
   bool capturing = ncclCudaGraphValid(comm->planner.capturingGraph);
   uint32_t currentSeq = ++comm->ceColl.ceSeqNum;
 
+  // Store the updated sequence number in the device buffer.
+  if (!capturing) {
+    CUCHECKGOTO(cuStreamWriteValue32(stream, (CUdeviceptr)comm->ceColl.ceSeqNumDev, currentSeq,
+                                     CU_STREAM_WRITE_VALUE_DEFAULT), ret, fail);
+  }
   // Write our own ready/complete flag to remote ranks using cudaMemcpyAsync
   for (int r = 0; r < comm->nRanks; ++r) {
     if (r == comm->rank) continue;
@@ -180,11 +194,7 @@ ncclResult_t ncclPrepUCSync(struct ncclComm* comm, bool isComplete,
     void* dstPtr = isComplete ? (void*)&completePtrs[comm->rank] : (void*)&readyPtrs[comm->rank];
     size_t offset = (uint8_t*)dstPtr - (uint8_t*)comm->ceColl.ceSyncWin->userPtr;
     NCCLCHECKGOTO(ncclDevrGetLsaRankPtr(comm, comm->ceColl.ceSyncWin, offset, r, &peerDstPtr), ret, fail);
-    if (capturing) {
-      CUDACHECKGOTO(cudaMemcpyAsync(peerDstPtr, &GRAPH_SYNC_VALUE, sizeof(uint32_t), cudaMemcpyHostToDevice, stream), ret, fail);
-    } else {
-      CUDACHECKGOTO(cudaMemcpyAsync(peerDstPtr, &currentSeq, sizeof(uint32_t), cudaMemcpyHostToDevice, stream), ret, fail);
-    }
+    CUDACHECKGOTO(cudaMemcpyAsync(peerDstPtr, comm->ceColl.ceSeqNumDev+capturing, sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream), ret, fail);
   }
 
   // Add local wait operations for every other rank
@@ -214,7 +224,9 @@ ncclResult_t ncclMemOpSync(struct ncclComm* comm, struct ncclCeCollArgs* args, c
   uint32_t* completePtrs = (uint32_t*)comm->ceColl.baseUCSymComplPtr;
 
   // Allocate enough slots for all possible ops
-  size_t batchSize = (comm->nvlsSupport ? NCCL_CE_SYNC_OPS_PER_RANK_MC : NCCL_CE_SYNC_OPS_PER_RANK_UC) * comm->nRanks;
+  // For cross-clique, NVLS multicast isn't available across cliques - use unicast sync instead
+  bool useMCSync = comm->nvlsSupport && !comm->p2pCrossClique;
+  size_t batchSize = (useMCSync ? NCCL_CE_SYNC_OPS_PER_RANK_MC : NCCL_CE_SYNC_OPS_PER_RANK_UC) * comm->nRanks;
   size_t opIdx = 0;
   CUstreamBatchMemOpParams* batchParams = nullptr;
 
@@ -225,7 +237,7 @@ ncclResult_t ncclMemOpSync(struct ncclComm* comm, struct ncclCeCollArgs* args, c
   // Prepare batch memory operations for synchronization
   NCCLCHECKGOTO(ncclCalloc(&batchParams, batchSize), ret, fail);
 
-  if (comm->nvlsSupport) {
+  if (useMCSync) {
     NCCLCHECKGOTO(ncclPrepMCSync(comm, comm->ceColl.useCompletePtr, batchParams, &opIdx, stream), ret, fail);
   } else {
     NCCLCHECKGOTO(ncclPrepUCSync(comm, comm->ceColl.useCompletePtr, batchParams, &opIdx, stream), ret, fail);
@@ -361,6 +373,10 @@ ncclResult_t ncclCeLaunchBatchOps(struct ncclComm* comm, struct ncclCeCollArgs* 
       if (params->intraBatchSync && ((i+1) % comm->ceColl.intraBatchSyncFreq == 0) && ((i+1) < params->numOps)) {
         NCCLCHECKGOTO(ncclMemOpSync(comm, args, stream), ret, fail);
       }
+    }
+    // WORKAROUND: This is a workaround to ensure that there is always an even number of intra-batch synchronization operations.
+    if (params->intraBatchSync && ((params->numOps + comm->ceColl.intraBatchSyncFreq - 1) / comm->ceColl.intraBatchSyncFreq) % 2 == 0) {
+      NCCLCHECKGOTO(ncclMemOpSync(comm, args, stream), ret, fail);
     }
   }
   //--------------No graph capture / not legacy stream--------------

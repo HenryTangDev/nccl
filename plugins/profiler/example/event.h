@@ -392,6 +392,9 @@ struct context {
   int ceBatchPoolBase;
   int ceBatchPoolIndex;
   struct ceBatch* ceBatchPool;
+
+  // Set during communicator teardown to stop accepting new event updates.
+  int finalizing;
 };
 
 template <typename T>

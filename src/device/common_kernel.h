@@ -10,6 +10,7 @@
 
 #include "device.h"
 #include "op128.h"
+#include "nccl_device/utility.h"
 #include "reduce_kernel.h"
 #include <cstdio>
 #include <cstdint>
@@ -216,7 +217,6 @@ __device__ __forceinline__ void reduceCopy(
   static_assert(MultimemSrcs <= MinSrcs && MultimemDsts <= MinDsts, "Multimem pointers cannot exceed respective Min values.");
   //int nWarps = nThreads/WARP_SIZE;
   //int warp = thread/WARP_SIZE;
-  int lane = thread%WARP_SIZE;
   // If a multimem src is present then our biggest pack size is limited to what
   // is supported for this redfn/type.
   constexpr int BigPackSize = (MultimemSrcs == 0) ? 16 : LoadMultimem_BigPackSize<RedFn>::BigPackSize;
@@ -227,12 +227,9 @@ __device__ __forceinline__ void reduceCopy(
   IntBytes nBytesBehind = 0;
   IntBytes nBytesAhead = nElts*sizeof(T);
 
-  #if __cpp_if_constexpr
-  if constexpr (BigPackSize > sizeof(T)) {
-  #else
-  if (BigPackSize > sizeof(T)) {
-  #endif
+  if NCCL_IF_CONSTEXPR (BigPackSize > sizeof(T)) {
     // Check that all pointers are BigPackSize aligned.
+    int lane = thread%WARP_SIZE;
     bool aligned = true;
     if (lane < nSrcs) aligned &= 0 == cvta_to_global(srcPtrFn(lane)) % (BigPackSize + !BigPackSize);
     if (lane < nDsts) aligned &= 0 == cvta_to_global(dstPtrFn(lane)) % (BigPackSize + !BigPackSize);

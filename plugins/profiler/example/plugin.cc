@@ -70,6 +70,87 @@ double getProfilerStartTime(void) {
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static pid_t pid;
 static int* eActivationMaskPtr;
+static void freeContextPools(struct context* ctx);
+static pthread_mutex_t deferredCtxLock = PTHREAD_MUTEX_INITIALIZER;
+static struct context* deferredCtxList[1024];
+static int deferredCtxCount = 0;
+
+static void deferContextFree(struct context* ctx) {
+  pthread_mutex_lock(&deferredCtxLock);
+  if (deferredCtxCount < 1024) {
+    deferredCtxList[deferredCtxCount++] = ctx;
+  }
+  pthread_mutex_unlock(&deferredCtxLock);
+}
+
+static void freeDeferredContexts() {
+  pthread_mutex_lock(&deferredCtxLock);
+  for (int i = 0; i < deferredCtxCount; i++) {
+    struct context* ctx = deferredCtxList[i];
+    if (!ctx) continue;
+    freeContextPools(ctx);
+    free(ctx);
+    deferredCtxList[i] = nullptr;
+  }
+  deferredCtxCount = 0;
+  pthread_mutex_unlock(&deferredCtxLock);
+}
+
+static inline struct context* getTaskEventCtx(struct taskEventBase* base) {
+  if (!base || !base->parent) return nullptr;
+  if (base->type == ncclProfileColl) return ((struct collApi*)base->parent)->ctx;
+  if (base->type == ncclProfileP2p) return ((struct p2pApi*)base->parent)->ctx;
+  return nullptr;
+}
+
+static struct context* contextFromEventHandle(void* eHandle) {
+  if (!eHandle) return nullptr;
+  uint64_t type = *(uint64_t*)eHandle;
+  switch (type) {
+  case ncclProfileGroupApi: return ((struct groupApi*)eHandle)->ctx;
+  case ncclProfileCollApi: return ((struct collApi*)eHandle)->ctx;
+  case ncclProfileP2pApi: return ((struct p2pApi*)eHandle)->ctx;
+  case ncclProfileKernelLaunch: {
+    struct kernelLaunch* ev = (struct kernelLaunch*)eHandle;
+    return ev->parent ? ev->parent->ctx : nullptr;
+  }
+  case ncclProfileGroup: return ((struct group*)eHandle)->ctx;
+  case ncclProfileColl:
+  case ncclProfileP2p: return getTaskEventCtx((struct taskEventBase*)eHandle);
+  case ncclProfileProxyCtrl: return ((struct proxyCtrl*)eHandle)->ctx;
+  case ncclProfileProxyOp: {
+    struct proxyOp* ev = (struct proxyOp*)eHandle;
+    return ev->parent ? getTaskEventCtx(ev->parent) : nullptr;
+  }
+  case ncclProfileProxyStep: {
+    struct proxyStep* ev = (struct proxyStep*)eHandle;
+    return (ev->parent && ev->parent->parent) ? getTaskEventCtx(ev->parent->parent) : nullptr;
+  }
+  case ncclProfileNetPlugin: {
+    struct netPlugin* ev = (struct netPlugin*)eHandle;
+    return (ev->parent && ev->parent->parent && ev->parent->parent->parent)
+             ? getTaskEventCtx(ev->parent->parent->parent)
+             : nullptr;
+  }
+  case ncclProfileKernelCh: {
+    struct kernelCh* ev = (struct kernelCh*)eHandle;
+    return getTaskEventCtx(ev->parent);
+  }
+  case ncclProfileCeColl: {
+    struct ceColl* ev = (struct ceColl*)eHandle;
+    return ev->parent ? ev->parent->ctx : nullptr;
+  }
+  case ncclProfileCeSync: {
+    struct ceSync* ev = (struct ceSync*)eHandle;
+    return (ev->parent && ev->parent->parent) ? ev->parent->parent->ctx : nullptr;
+  }
+  case ncclProfileCeBatch: {
+    struct ceBatch* ev = (struct ceBatch*)eHandle;
+    return (ev->parent && ev->parent->parent) ? ev->parent->parent->ctx : nullptr;
+  }
+  default: return nullptr;
+  }
+}
 
 // Initialize pool sizes from environment variables
 static void initPoolSizes(void) {
@@ -164,6 +245,7 @@ static ncclResult_t allocateContextPools(struct context* ctx) {
   ctx->ceBatchPoolSize = ceBatchPoolSize;
   ctx->ceBatchPoolBase = 0;
   ctx->ceBatchPoolIndex = 0;
+  ctx->finalizing = 0;
 
   return ncclSuccess;
 
@@ -339,9 +421,12 @@ __hidden ncclResult_t exampleProfilerFinalize(void* context) {
   char filename[PATH_MAX] = { 0 };
   FILE* fh = openTraceFile(ctx, filename, sizeof(filename));
 
-  INFO(NCCL_INIT, "PROFILER/Plugin: finalize commName: %s commHash: %lu nranks: %d rank: %d traceFile: %s",
+  INFO(NCCL_DESTROY, "PROFILER/Plugin: finalize commName: %s commHash: %lu nranks: %d rank: %d traceFile: %s",
        ctx->commName ? ctx->commName : "", ctx->commHash, ctx->nranks, ctx->rank,
        filename[0] ? filename : "none");
+
+  // Stop accepting any further updates for this context while dumping.
+  __atomic_store_n(&ctx->finalizing, 1, __ATOMIC_RELAXED);
 
   // Wait for poller to complete pending events
   usleep(10000);
@@ -361,11 +446,11 @@ __hidden ncclResult_t exampleProfilerFinalize(void* context) {
   // Then cleanup and free resources
   ceProfilerCleanupPendingEvents(ctx);
   ceProfilerDeregisterContext(ctx);
-  freeContextPools(ctx);
-  free(ctx);
+  deferContextFree(ctx);
 
   if (__atomic_sub_fetch(&initialized, 1, __ATOMIC_RELAXED) == 0) {
     finalizeGlobalProfiler(fh);
+    freeDeferredContexts();
   }
 
   if (fh) fprintf(fh, "{}]\n");
@@ -380,6 +465,9 @@ __hidden ncclResult_t exampleProfilerStartEvent(void* context, void** eHandle, n
   *eHandle = NULL;
   struct context* ctx = (struct context *)context;
   if (ctx == NULL) {
+    return ncclSuccess;
+  }
+  if (__atomic_load_n(&ctx->finalizing, __ATOMIC_RELAXED)) {
     return ncclSuccess;
   }
   if (eDescr->type == ncclProfileGroupApi) {
@@ -853,6 +941,10 @@ void updateEvent(void* handle) {
 __hidden ncclResult_t exampleProfilerStopEvent(void* eHandle) {
   // the event handle might be null if we run out of events
   if (eHandle == NULL) return ncclSuccess;
+  struct context* eventCtx = contextFromEventHandle(eHandle);
+  if (eventCtx && __atomic_load_n(&eventCtx->finalizing, __ATOMIC_RELAXED)) {
+    return ncclSuccess;
+  }
 
   uint64_t type = *(uint64_t *)eHandle;
   // Stopping API events, Kernel Launch events, collective/p2p task events
@@ -895,6 +987,10 @@ __hidden ncclResult_t exampleProfilerStopEvent(void* eHandle) {
 __hidden ncclResult_t exampleProfilerRecordEventState(void* eHandle, ncclProfilerEventState_t eState, ncclProfilerEventStateArgs_t* eStateArgs) {
   // the event handle might be null if we run out of events
   if (eHandle == NULL) return ncclSuccess;
+  struct context* eventCtx = contextFromEventHandle(eHandle);
+  if (eventCtx && __atomic_load_n(&eventCtx->finalizing, __ATOMIC_RELAXED)) {
+    return ncclSuccess;
+  }
 
   uint64_t type = *(uint64_t *)eHandle;
   if (type == ncclProfileGroupApi) {

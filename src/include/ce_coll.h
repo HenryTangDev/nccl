@@ -26,6 +26,7 @@ struct ncclCeColl {
   uint32_t intraBatchSyncFreq;
   uint64_t intraBatchSyncMsgThreshold;
   struct ncclDevrWindow* ceSyncWin;
+  uint32_t* ceSeqNumDev; // Index 0 for the current value, 1 for GRAPH_SYNC_VALUE
 };
 
 struct ncclCeInitTask {
